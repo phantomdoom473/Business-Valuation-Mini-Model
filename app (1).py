@@ -9,7 +9,7 @@ from plotly.subplots import make_subplots
 # ============================================
 # PAGE CONFIG
 # ============================================
-st.set_page_config(page_title="Company Valuation Explorer", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Company Valuation Explorer", layout="wide")
 
 st.title("Company Valuation Explorer")
 st.caption("Type a company name — you don't need to know the ticker.")
@@ -44,7 +44,7 @@ def search_ticker(query):
 # ============================================
 with st.sidebar:
     st.header("Find a company")
-    query = st.text_input("Company name", placeholder="e.g. Tesla, Aramco, Apple")
+    query = st.text_input("Company name", placeholder="e.g. Aramco, Apple")
 
     selected_ticker = None
     selected_name = None
@@ -259,4 +259,3 @@ elif run_button:
                        "thinly-traded stocks often have incomplete data on Yahoo Finance.")
 
 st.divider()
-st.caption("A learning project, not financial advice. Figures are estimates built on simplified assumptions.")
