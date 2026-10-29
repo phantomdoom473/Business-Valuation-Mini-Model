@@ -17,8 +17,15 @@ st.caption("Type a company name — you don't need to know the ticker.")
 # ============================================
 # TICKER SEARCH (name → ticker, real-time)
 # ============================================
+@st.cache_data(ttl=3600, show_spinner=False)
 def search_ticker(query):
-    """Searches Yahoo Finance for tickers matching a company name."""
+    """Searches Yahoo Finance for tickers matching a company name.
+
+    Cached: Streamlit reruns the whole script on every keystroke, so without
+    this the search box fires a Yahoo request per character typed. That is
+    what gets the app's IP rate-limited, which in turn is what makes the
+    valuation fetch below come back empty.
+    """
     if not query or len(query) < 2:
         return []
     url = "https://query2.finance.yahoo.com/v1/finance/search"
@@ -37,6 +44,82 @@ def search_ticker(query):
         return results
     except Exception:
         return []
+
+
+# ============================================
+# KEY DATA (price / shares / market cap / currency)
+# ============================================
+def _pick(source, *keys):
+    """First non-empty value among `keys`, from a dict or a fast_info object."""
+    for k in keys:
+        try:
+            v = source.get(k) if hasattr(source, "get") else source[k]
+        except Exception:
+            v = None
+        if v:
+            return v
+    return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_key_data(symbol):
+    """Price, share count, market cap, beta and currency for `symbol`.
+
+    yfinance's `.info` depends on Yahoo's cookie/crumb auth, which fails
+    intermittently on shared hosts and fails most often on non-US listings
+    such as 2222.SR. So every field has at least one fallback, and anything
+    still missing is derived from the fields that did arrive.
+    """
+    t = yf.Ticker(symbol)
+    price = shares = market_cap = currency = beta = None
+
+    # 1. fast_info needs no crumb, so it survives when .info does not.
+    try:
+        fi = t.fast_info
+        price = _pick(fi, "lastPrice", "last_price", "regularMarketPrice")
+        shares = _pick(fi, "shares", "sharesOutstanding", "shares_outstanding")
+        market_cap = _pick(fi, "marketCap", "market_cap")
+        currency = _pick(fi, "currency")
+    except Exception:
+        pass
+
+    # 2. .info — richer, but the unreliable one.
+    try:
+        info = t.info or {}
+    except Exception:
+        info = {}
+    price = price or _pick(info, "currentPrice", "regularMarketPrice", "previousClose")
+    shares = shares or _pick(info, "sharesOutstanding", "impliedSharesOutstanding")
+    market_cap = market_cap or _pick(info, "marketCap")
+    currency = currency or _pick(info, "currency", "financialCurrency")
+    beta = _pick(info, "beta")
+
+    # 3. The last close is the most dependable price there is.
+    if not price:
+        try:
+            hist = t.history(period="1mo")
+            if not hist.empty:
+                price = float(hist["Close"].dropna().iloc[-1])
+        except Exception:
+            pass
+
+    # 4. The full share-count series, when the single field is absent.
+    if not shares:
+        try:
+            sf = t.get_shares_full(start="2023-01-01")
+            if sf is not None and len(sf):
+                shares = float(sf.dropna().iloc[-1])
+        except Exception:
+            pass
+
+    # 5. Any two of price / shares / market cap give the third.
+    if not shares and market_cap and price:
+        shares = market_cap / price
+    if not market_cap and shares and price:
+        market_cap = shares * price
+
+    return {"price": price, "shares": shares, "market_cap": market_cap,
+            "currency": currency or "", "beta": beta or 1.0}
 
 
 # ============================================
@@ -91,18 +174,26 @@ elif run_button:
     with st.spinner(f"Fetching data for {selected_name} ({selected_ticker})..."):
         try:
             company = yf.Ticker(selected_ticker)
-            info = company.info
+            key = load_key_data(selected_ticker)
             cashflow_stmt = company.cashflow
             balance_sheet = company.balance_sheet
 
-            current_price = info.get("currentPrice") or info.get("regularMarketPrice")
-            shares_outstanding = info.get("sharesOutstanding")
-            market_cap = info.get("marketCap")
-            beta = info.get("beta") or 1.0
+            current_price = key["price"]
+            shares_outstanding = key["shares"]
+            market_cap = key["market_cap"]
+            beta = key["beta"]
+            currency = key["currency"]          # "SAR" for 2222.SR, "USD" for US listings
 
-            if current_price is None or shares_outstanding is None or market_cap is None:
-                st.error("Missing key data for this company (price, shares outstanding, or market cap). "
-                         "Try a bigger, more widely-covered company.")
+            missing = [label for label, value in (("price", current_price),
+                                                   ("share count", shares_outstanding),
+                                                   ("market cap", market_cap)) if not value]
+            if missing:
+                st.error(
+                    f"Couldn't load {', '.join(missing)} for {selected_name}. "
+                    "Yahoo Finance is either rate-limiting this app or doesn't carry that "
+                    "field for this listing. Wait a minute and try again, or pick a more "
+                    "widely-covered company."
+                )
                 st.stop()
 
             # --- Free Cash Flow ---
@@ -125,8 +216,10 @@ elif run_button:
             most_recent_fcf = fcf_values[-1]
 
             if len(fcf_values) > 1:
+                # Only measure growth off a positive base. A negative prior-year
+                # FCF flips the sign and produces a meaningless growth rate.
                 historical_growth_rates = [(fcf_values[i] / fcf_values[i - 1]) - 1
-                                            for i in range(1, len(fcf_values)) if fcf_values[i - 1] != 0]
+                                            for i in range(1, len(fcf_values)) if fcf_values[i - 1] > 0]
                 avg_historical_growth = np.mean(historical_growth_rates) if historical_growth_rates else 0.03
             else:
                 avg_historical_growth = 0.03
@@ -146,8 +239,10 @@ elif run_button:
             weight_equity = market_cap / total_value
             weight_debt = total_debt / total_value if total_value > 0 else 0
 
-            WACC = (weight_equity * cost_of_equity) + (weight_debt * cost_of_debt * (1 - tax_rate))
-            WACC = max(WACC, terminal_growth + 0.01)  # safety floor so the math doesn't break
+            wacc_calculated = (weight_equity * cost_of_equity) + (weight_debt * cost_of_debt * (1 - tax_rate))
+            wacc_floor = terminal_growth + 0.01       # keeps (WACC - g) from collapsing
+            WACC = max(wacc_calculated, wacc_floor)
+            wacc_was_floored = WACC > wacc_calculated
 
             # --- Project FCF ---
             projected_fcf = []
@@ -174,10 +269,18 @@ elif run_button:
             st.subheader(f"Results: {selected_name} ({selected_ticker})")
 
             col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Intrinsic Value", f"${intrinsic_value_per_share:,.2f}")
-            col2.metric("Current Market Price", f"${current_price:,.2f}")
+            col1.metric("Intrinsic Value", f"{intrinsic_value_per_share:,.2f} {currency}".strip())
+            col2.metric("Current Market Price", f"{current_price:,.2f} {currency}".strip())
             col3.metric("Implied Upside/Downside", f"{upside_downside:+.1%}")
             col4.metric("WACC (discount rate)", f"{WACC:.2%}")
+
+            if wacc_was_floored:
+                st.warning(
+                    f"The calculated WACC was {wacc_calculated:.2%}, below the terminal growth "
+                    f"rate of {terminal_growth:.2%}. The model floored it at {WACC:.2%} so the "
+                    "terminal value stays finite. Treat this valuation as unreliable — lower "
+                    "the terminal growth rate and run it again."
+                )
 
             if upside_downside > 0.10:
                 st.success(f"{selected_name} looks undervalued in this model. "
@@ -232,12 +335,16 @@ elif run_button:
                 colorscale="RdYlGn", showscale=False
             ), row=2, col=1)
 
-            # 4. Price history
-            hist = company.history(period="2y")
-            fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"], mode="lines",
-                                       line=dict(color="#3182bd"), name="Market Price"), row=2, col=2)
-            fig.add_hline(y=intrinsic_value_per_share, line_dash="dash", line_color="#2ca25f",
-                          row=2, col=2)
+            # 4. Price history — optional, so a failure here must not lose the valuation
+            try:
+                hist = company.history(period="2y")
+            except Exception:
+                hist = None
+            if hist is not None and not hist.empty:
+                fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"], mode="lines",
+                                           line=dict(color="#3182bd"), name="Market Price"), row=2, col=2)
+                fig.add_hline(y=intrinsic_value_per_share, line_dash="dash", line_color="#2ca25f",
+                              row=2, col=2)
 
             fig.update_layout(height=700, showlegend=False,
                                title_text=f"{selected_name} — Valuation Dashboard")
@@ -250,8 +357,11 @@ elif run_button:
                 st.write(f"- **Terminal growth rate:** {terminal_growth:.2%}")
                 st.write(f"- **Cost of equity (CAPM):** {cost_of_equity:.2%}")
                 st.write(f"- **WACC:** {WACC:.2%}")
-                st.write(f"- **Net debt:** ${net_debt:,.0f}")
+                st.write(f"- **Spread (WACC − terminal growth):** {WACC - terminal_growth:.2%} "
+                         "— the smaller this is, the more the valuation swings on the discount rate")
+                st.write(f"- **Net debt:** {net_debt:,.0f} {currency}".strip())
                 st.write(f"- **Beta:** {beta:.2f}")
+                st.write(f"- **Reporting currency:** {currency or 'unknown'}")
 
         except Exception as e:
             st.error(f"Something went wrong pulling data for this company: {e}")
